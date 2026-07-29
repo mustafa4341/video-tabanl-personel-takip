@@ -2,7 +2,9 @@
 __pycache__/
 *.pyc
 datasets/construction_safety/
-runs/detect/train/
-runs/detect/train-2/
+runs/
+outputs/
+video/*.mp4
 *.pt
-!runs/detect/train-3/weights/best.pt
+!models/best.pt
+

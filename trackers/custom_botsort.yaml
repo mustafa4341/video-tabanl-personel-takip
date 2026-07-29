@@ -1,0 +1,19 @@
+# BoT-SORT tracker — ReID aktif, engel arkası ID koruma optimizasyonlu
+# Docs: https://docs.ultralytics.com/modes/track
+
+tracker_type: botsort
+track_high_thresh: 0.30
+track_low_thresh: 0.10
+new_track_thresh: 0.25
+track_buffer: 150
+match_thresh: 0.7
+fuse_score: True
+
+# BoT-SORT specifics
+gmc_method: sparseOptFlow
+
+# ReID — görünüş öznitelikleriyle kişiyi yeniden tanıma (engel sonrası ID koruma)
+proximity_thresh: 0.5
+appearance_thresh: 0.25
+with_reid: True
+model: auto
