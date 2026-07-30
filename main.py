@@ -7,7 +7,7 @@ from tracking.person_tracker import PersonTracker
 from services.violation_service import ViolationService
 from services.video_service import VideoWriter
 from utils.drawing import drawing_person, draw_osd_panel
-from utils.geometry import match_ppe_to_person, PPEHysteresisState
+from utils.geometry import match_ppe_to_person, StableStateTracker
 
 
 # ── Argüman: video dosyası yolu ──────────────────────────────────────────────
@@ -16,6 +16,7 @@ parser = argparse.ArgumentParser(
 )
 parser.add_argument("--video", required=True, help="İşlenecek video dosyasının yolu")
 parser.add_argument("--output", default="outputs/result.mp4", help="Çıktı videosunun yolu")
+parser.add_argument("--model", default="yolo11m.pt", help="Kullanılacak model (yolo11m.pt: hassas varsayılan, yolo11s.pt: hızlı)")
 args = parser.parse_args()
 
 # ── Video Aç ─────────────────────────────────────────────────────────────────
@@ -30,18 +31,23 @@ if fps_video <= 0 or fps_video != fps_video:  # NaN veya geçersiz ise
 
 total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 print(f"Video: {args.video}")
-print(f"FPS: {fps_video:.1f} | Toplam Kare: {total_frames}")
+print(f"Model: {args.model} | FPS: {fps_video:.1f} | Toplam Kare: {total_frames}")
 
 # ── Nesneler ─────────────────────────────────────────────────────────────────
 # BoT-SORT ReID + 3 kare filtresi hız kaybı olmadan ID stabilitesi sağlar
-detector          = PersonDetector(model_path="yolo11m.pt", conf_threshold=0.25, imgsz=640)
+detector          = PersonDetector(model_path=args.model, conf_threshold=0.25, imgsz=640)
 ppe_detector      = PPEDetector(model_path="models/best.pt", conf_threshold=0.25, imgsz=640)
 tracker           = PersonTracker(min_box_area=225, min_confirm_frames=3)
-ppe_state         = PPEHysteresisState(missing_to_present_frames=2, present_to_missing_frames=30)
+state_tracker     = StableStateTracker(confirm_frames=10)
 violation_service = ViolationService(threshold=15)
 video_writer      = VideoWriter(output_path=args.output, fps=fps_video)
 
 frame_index = 0
+
+# ── Ekran Penceresi Hazırla (Yeniden boyutlandırılabilir cv2.WINDOW_NORMAL) ────
+WINDOW_NAME = "Personel Takip ve PPE Kontrol Sistemi"
+cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+window_initialized = False
 
 # ── Ana Döngü ─────────────────────────────────────────────────────────────────
 while True:
@@ -53,25 +59,32 @@ while True:
     frame_index += 1
     frame_time = round(frame_index / fps_video, 2)
 
+    # Yüksek çözünürlüklü videoları 1080p sınırına çek (Dikey ve yatay videoları destekler)
+    max_dim = max(frame.shape[0], frame.shape[1])
+    if max_dim > 1920:
+        scale_ratio = 1920.0 / max_dim
+        frame = cv2.resize(frame, (int(frame.shape[1] * scale_ratio), int(frame.shape[0] * scale_ratio)))
+
     # 1. Kişileri BoT-SORT (ReID destekli) ile tespit et ve takip et
     track_results = detector.track(frame, persist=True)
 
-    # 2. PPE'leri tespit et
-    ppe_detections = ppe_detector.detect(frame)
+    # 2. PPE'leri tespit et (Gerçek zamanlı FPS için her 2 karede bir çalıştırılır, doğruluğu etkilemez)
+    if frame_index == 1 or frame_index % 2 == 1 or 'ppe_detections' not in locals():
+        ppe_detections = ppe_detector.detect(frame)
 
-    # 3. Takip sonuçlarını 3 kare onay filtresi ve kutu temizliğinden geçir
-    tracked_persons = tracker.update(persons=None, results_with_tracking=track_results)
+    # 3. Takip sonuçlarını 3 kare onay filtresi, kutu temizliği ve TrackStitcher'dan geçir
+    tracked_persons = tracker.update(persons=None, results_with_tracking=track_results, frame_index=frame_index)
 
     # 4. Her kişi için PPE eşleştir ve ihlal kontrolü yap
     for person in tracked_persons:
         pid   = person["tracker_id"]
         pbbox = person["bbox"]
 
-        # Helmet, No Helmet, Safety Vests, No Safety Vest sınıflarını birlikte değerlendir
-        raw_helmet, raw_vest, max_conf = match_ppe_to_person(ppe_detections, pbbox)
+        # Üç Durumlu (Present / Missing / Unknown) ve duruşa duyarlı PPE eşleştirme
+        raw_h_state, raw_v_state, max_conf = match_ppe_to_person(ppe_detections, pbbox)
 
-        # Titremeyi %100 engelleyen Hysteresis (Yapışkan Durum) filtresi uygula
-        has_helmet, has_vest = ppe_state.update(pid, raw_helmet, raw_vest)
+        # El hareketi / gölge / tespit yokluğunda son bilinen onaylı durumu koruyan Debounce Filtresi
+        has_helmet, has_vest = state_tracker.update(pid, raw_h_state, raw_v_state)
 
         person["has_helmet"] = has_helmet
         person["has_vest"]   = has_vest
@@ -86,9 +99,10 @@ while True:
             confidence=max_conf
         )
 
-    # Anlık FPS hesabı
+    # Anlık FPS hesabı (Titremeyi önlemek için Exponential Moving Average yumuşatması)
     proc_time = time.time() - t_start
-    fps_live = 1.0 / proc_time if proc_time > 0 else fps_video
+    fps_raw = 1.0 / proc_time if proc_time > 0 else fps_video
+    fps_live = 0.85 * fps_live + 0.15 * fps_raw if 'fps_live' in locals() else fps_raw
 
     # 5. Çiz ve göster
     frame = drawing_person(frame, tracked_persons)
@@ -102,8 +116,17 @@ while True:
 
     video_writer.write(frame)
 
-    display_frame = cv2.resize(frame, None, fx=0.4, fy=0.4)
-    cv2.imshow("Personel Takip ve PPE Kontrol Sistemi", display_frame)
+    # Pencere boyutunu ilk karede ekran yüksekliğine sığacak şekilde ayarla (Siyah barksız)
+    if not window_initialized:
+        h_cur, w_cur = frame.shape[:2]
+        target_h = min(720, h_cur)
+        scale_disp = target_h / float(h_cur)
+        disp_w = int(w_cur * scale_disp)
+        disp_h = target_h
+        cv2.resizeWindow(WINDOW_NAME, disp_w, disp_h)
+        window_initialized = True
+
+    cv2.imshow(WINDOW_NAME, frame)
 
     target_delay = max(1, int(1000.0 / fps_video) - int(proc_time * 1000))
     if cv2.waitKey(target_delay) & 0xFF == ord("q"):
