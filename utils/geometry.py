@@ -157,9 +157,11 @@ class StableStateTracker:
         return h_bool, v_bool
 
     def _update_single(self, track_id, raw_state, confirmed_map, pending_map):
-        # 1. Tespit yoksa (Unknown): Henüz onaylı durum yoksa False (Missing) dön, varsa son bilinen onaylı durumu koru
+        # 1. Tespit yoksa (Unknown):
+        # Henüz onaylı bir durum yoksa, varsayılan olarak True (Present) kabul et (yanlış ihlal saymasını önler).
+        # Onaylı durum varsa son onaylı durumu korur.
         if raw_state == "Unknown":
-            return confirmed_map.get(track_id, False)
+            return confirmed_map.get(track_id, True)
 
         bool_raw = (raw_state == "Present")
 
