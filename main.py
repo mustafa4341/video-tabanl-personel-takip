@@ -1,4 +1,5 @@
 import cv2
+import os
 import time
 import argparse
 from detectors.person_detector import PersonDetector
@@ -16,7 +17,10 @@ parser = argparse.ArgumentParser(
 )
 parser.add_argument("--video", required=True, help="İşlenecek video dosyasının yolu")
 parser.add_argument("--output", default="outputs/result.mp4", help="Çıktı videosunun yolu")
-parser.add_argument("--model", default="yolo11m.pt", help="Kullanılacak model (yolo11m.pt: hassas varsayılan, yolo11s.pt: hızlı)")
+OVERHEAD_WEIGHTS = "runs/detect/yolo11m_overhead_person/weights/best.pt"
+default_model = OVERHEAD_WEIGHTS if os.path.exists(OVERHEAD_WEIGHTS) else "yolo11m.pt"
+
+parser.add_argument("--model", default=default_model, help="Kullanılacak model yolu (Varsayılan: yeni eğitilen tepeden insan modeli)")
 args = parser.parse_args()
 
 # ── Video Aç ─────────────────────────────────────────────────────────────────
@@ -35,9 +39,9 @@ print(f"Model: {args.model} | FPS: {fps_video:.1f} | Toplam Kare: {total_frames}
 
 # ── Nesneler ─────────────────────────────────────────────────────────────────
 # BoT-SORT ReID + 3 kare filtresi hız kaybı olmadan ID stabilitesi sağlar
-detector          = PersonDetector(model_path=args.model, conf_threshold=0.25, imgsz=640)
-ppe_detector      = PPEDetector(model_path="models/best.pt", conf_threshold=0.25, imgsz=640)
-tracker           = PersonTracker(min_box_area=225, min_confirm_frames=3)
+detector          = PersonDetector(model_path=args.model, conf_threshold=0.20, imgsz=1024)
+ppe_detector      = PPEDetector(model_path="models/best.pt", conf_threshold=0.20, imgsz=640)
+tracker           = PersonTracker(min_box_area=100, min_confirm_frames=3)
 state_tracker     = StableStateTracker(confirm_frames=10)
 violation_service = ViolationService(threshold=15)
 video_writer      = VideoWriter(output_path=args.output, fps=fps_video)

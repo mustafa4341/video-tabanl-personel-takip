@@ -53,21 +53,19 @@ def is_ppe_belonging_to_person(ppe_box, person_box, ppe_type="helmet"):
     if not (py1 - margin_y <= cy <= py2 + margin_y):
         return False
 
-    # Eğilmiş kişi kontrolü (Genişlik > Yükseklik * 1.1)
-    is_bending = (p_w > p_h * 1.1)
+    # Eğilmiş veya öne eğilmiş kişi kontrolü (Genişlik > Yükseklik * 0.70)
+    is_bending = (p_w > p_h * 0.70)
 
     if ppe_type == "helmet":
         if is_bending:
-            # Eğilmiş kişide baret kutunun herhangi bir tarafında olabilir
+            # Eğilmiş/eğik duran kişide baret kutunun herhangi bir yerinde olabilir
             return True
         else:
-            # Ayaktaki kişide baret üst %50'de olmalı
-            return cy <= py1 + p_h * 0.50
+            # Ayaktaki kişide baret üst %60'lık kafa bölgesinde olmalı
+            return cy <= py1 + p_h * 0.60
     elif ppe_type == "vest":
-        if is_bending:
-            return True
-        else:
-            return py1 + p_h * 0.12 <= cy <= py2 - p_h * 0.10
+        # Yelek kutusu zaten insan kutusunun içinde ise (is_center_in_box) geçerli sayılır (eğilme/yan durma uyumlu)
+        return True
     return True
 
 
@@ -159,9 +157,9 @@ class StableStateTracker:
         return h_bool, v_bool
 
     def _update_single(self, track_id, raw_state, confirmed_map, pending_map):
-        # 1. Tespit yoksa (Unknown): Son bilinen onaylı durumu koru
+        # 1. Tespit yoksa (Unknown): Henüz onaylı durum yoksa False (Missing) dön, varsa son bilinen onaylı durumu koru
         if raw_state == "Unknown":
-            return confirmed_map.get(track_id, True)
+            return confirmed_map.get(track_id, False)
 
         bool_raw = (raw_state == "Present")
 
