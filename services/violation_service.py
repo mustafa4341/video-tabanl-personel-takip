@@ -33,7 +33,9 @@ class ViolationManager:
         img_path = f"outputs/violations/id_{stable_id}_{violation_type}_{time_clean}.jpg"
 
         if frame is not None:
-            cv2.imwrite(img_path, frame)
+            success, buf = cv2.imencode(".jpg", frame)
+            if success:
+                buf.tofile(img_path)
 
         self.recent_violations.append({
             "stable_id": stable_id,

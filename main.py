@@ -50,7 +50,12 @@ frame_index = 0
 
 # ── Ekran Penceresi Hazırla (Yeniden boyutlandırılabilir cv2.WINDOW_NORMAL) ────
 WINDOW_NAME = "Personel Takip ve PPE Kontrol Sistemi"
-cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+has_gui = True
+try:
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+except Exception:
+    has_gui = False
+
 window_initialized = False
 
 # ── Ana Döngü ─────────────────────────────────────────────────────────────────
@@ -127,20 +132,31 @@ while True:
         scale_disp = target_h / float(h_cur)
         disp_w = int(w_cur * scale_disp)
         disp_h = target_h
-        cv2.resizeWindow(WINDOW_NAME, disp_w, disp_h)
+        if has_gui:
+            try:
+                cv2.resizeWindow(WINDOW_NAME, disp_w, disp_h)
+            except Exception:
+                has_gui = False
         window_initialized = True
 
-    cv2.imshow(WINDOW_NAME, frame)
-
-    target_delay = max(1, int(1000.0 / fps_video) - int(proc_time * 1000))
-    if cv2.waitKey(target_delay) & 0xFF == ord("q"):
-        break
+    if has_gui:
+        try:
+            cv2.imshow(WINDOW_NAME, frame)
+            target_delay = max(1, int(1000.0 / fps_video) - int(proc_time * 1000))
+            if cv2.waitKey(target_delay) & 0xFF == ord("q"):
+                break
+        except Exception:
+            has_gui = False
 
 # ── Kapat ve Kaydet ───────────────────────────────────────────────────────────
 violation_service.save()
 video_writer.release()
 cap.release()
-cv2.destroyAllWindows()
+if has_gui:
+    try:
+        cv2.destroyAllWindows()
+    except Exception:
+        pass
 
 # ── Metrik Raporu ─────────────────────────────────────────────────────────────
 unique_ids = tracker.get_unique_id_count()

@@ -1,0 +1,15 @@
+type: custom_model
+name: PPE Detection (Kask ve Yelek)
+display_name: PPE Detection
+model_type: yolov8
+model_format: onnx
+input_width: 640
+input_height: 640
+model_path: c:\Users\mmust\Desktop\video tabanlı bilgisayar takip proje\models\best.onnx
+classes:
+  - Helmet
+  - No Helmet
+  - Safety Vests
+  - No Safety Vest
+score_threshold: 0.10
+nms_threshold: 0.45
