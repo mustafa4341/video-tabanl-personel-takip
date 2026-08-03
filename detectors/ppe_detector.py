@@ -3,14 +3,16 @@ from ultralytics import YOLO
 class PPEDetector:
     """
     Sınıf Bazlı Hassas KKD Tespitçisi.
-    - Kask (küçük/parlak): conf_helmet = 0.30
-    - Yelek (geniş/mat): conf_vest = 0.35
+    - Helmet / Safety Vests: conf_helmet=0.30, conf_vest=0.35
+    - No Helmet / No Safety Vest: conf_no_helmet=0.25, conf_no_vest=0.25 (Negatif ihlalleri daha hızlı yakalar)
     """
-    def __init__(self, model_path="models/best.pt", conf_helmet=0.30, conf_vest=0.35, imgsz=640):
+    def __init__(self, model_path="models/best.pt", conf_helmet=0.30, conf_vest=0.35, conf_no_helmet=0.25, conf_no_vest=0.25, imgsz=640):
         self.model = YOLO(model_path)
         self.conf_helmet = conf_helmet
         self.conf_vest = conf_vest
-        self.min_conf = min(conf_helmet, conf_vest)
+        self.conf_no_helmet = conf_no_helmet
+        self.conf_no_vest = conf_no_vest
+        self.min_conf = min(conf_helmet, conf_vest, conf_no_helmet, conf_no_vest)
         self.imgsz = imgsz
 
     def detect(self, frame):
@@ -23,10 +25,14 @@ class PPEDetector:
                 class_name = self.model.names[class_id]
                 confidence = float(box.conf[0])
 
-                # Sınıf bazlı filtreleme
-                if "Helmet" in class_name and confidence < self.conf_helmet:
+                # Sınıf bazlı hassas filtreleme
+                if class_name == "Helmet" and confidence < self.conf_helmet:
                     continue
-                if "Vest" in class_name and confidence < self.conf_vest:
+                elif class_name == "No Helmet" and confidence < self.conf_no_helmet:
+                    continue
+                elif class_name == "Safety Vests" and confidence < self.conf_vest:
+                    continue
+                elif class_name == "No Safety Vest" and confidence < self.conf_no_vest:
                     continue
 
                 x1, y1, x2, y2 = map(int, box.xyxy[0])

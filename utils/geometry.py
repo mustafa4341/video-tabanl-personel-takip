@@ -80,8 +80,12 @@ def match_ppe_to_person(ppe_detections, person_bbox, pose_info=None):
     max_conf = 0.0
 
     # 🚨 KURAL: Bbox genişliği yüksekliğinden fazla ise (p_w > p_h):
-    # Eğilme/Çömelme/Yatay duruş hareketi -> 2 saniye boyunca önceki durumu koru, değiştireme ("Unknown" nötr döndür)
-    if p_w > p_h:
+    # ANCAK Pose Keypoint'leri kafa/gövdeyi net olarak göremiyorsa "Unknown" döndür!
+    # Eğer pose_info kafa veya gövde keypoint'lerini net (conf > 0.5) görüyorsa dondurma yapma, tespit yapılmasına izin ver!
+    head_keypoint_valid = pose_info and pose_info.get("has_valid_head_keypoints", False)
+    torso_keypoint_valid = pose_info and pose_info.get("has_valid_torso_keypoints", False)
+
+    if p_w > p_h and not (head_keypoint_valid or torso_keypoint_valid):
         return "Unknown", "Unknown", max_conf
 
     has_helmet = False
@@ -131,20 +135,16 @@ def match_ppe_to_person(ppe_detections, person_bbox, pose_info=None):
         helmet_raw_state = "Present"
     elif no_helmet_detected:
         helmet_raw_state = "Missing"  # Model açıkça No Helmet tespit etti -> Negatif Kanıt
-    elif pose_info and not pose_info.get("has_valid_head_keypoints", True):
-        helmet_raw_state = "Unknown"  # Kafa keypoint güveni < 0.5 -> Göremedim (Nötr)
     else:
-        helmet_raw_state = "Unknown"  # Model göremedi/açı kaybı var -> Kanıt Yok (Nötr)
+        helmet_raw_state = "Unknown"  # Model göremedi/açı kaybı var -> Tam Emin Değil (Nötr Tampon)
 
     # Yelek durumu (Present / Missing / Unknown)
     if has_vest:
         vest_raw_state = "Present"
     elif no_vest_detected:
         vest_raw_state = "Missing"   # Model açıkça No Safety Vest tespit etti -> Negatif Kanıt
-    elif pose_info and not pose_info.get("has_valid_torso_keypoints", True):
-        vest_raw_state = "Unknown"   # Gövde keypoint güveni < 0.5 -> Göremedim (Nötr)
     else:
-        vest_raw_state = "Unknown"   # Model göremedi/açı kaybı var -> Kanıt Yok (Nötr)
+        vest_raw_state = "Unknown"   # Model göremedi/açı kaybı var -> Tam Emin Değil (Nötr Tampon)
 
     return helmet_raw_state, vest_raw_state, max_conf
 
@@ -154,13 +154,10 @@ from collections import deque
 class StableStateTracker:
     """
     Kayan Pencere (Rolling Window) tabanlı Zaman Odaklı KKD Takipçisi.
+    - Histerezis (Yumuşak Akış) Tamponu: Tekil kare titremelerini engeller.
     - Bbox genişliği yüksekliğinden fazla olduğunda (w > h) 2 saniye boyunca durumu dondurur.
     - Zamana Dayalı (FPS-Independent): Sabit kare sayısı yerine videonun gerçek FPS değerine göre 
       pencere boyutunu dinamik hesaplar (her zaman gerçek 2.0s pencere, 1.5s min gözlem).
-    - Asimetrik Eşikler:
-      * present_ratio (0.75): "Var" (True) demek için pencerenin en az %75'i gerekli (Güçlü kanıt şartı).
-      * missing_ratio (0.35): "Yok" (False) demek için %35 veya altı yeterli (Güvenlik öncelikli ihlal tarafına düşme).
-      * %35 - %75 arası: Belirsiz ara bölge, son onaylı durumu korur (titremeyi engeller).
     """
     def __init__(self, fps=30.0, window_sec=2.0, min_obs_sec=1.5, present_ratio=0.75, missing_ratio=0.35):
         self.fps = fps if fps > 0 else 30.0
@@ -198,13 +195,18 @@ class StableStateTracker:
     def _update_single(self, track_id, raw_state, windows_map, state_map, force_hold=False):
         if track_id not in windows_map:
             windows_map[track_id] = deque(maxlen=self.window_size)
-            # Yanlış ihlal yazılmaması için başlangıç nötr True kabul edilir
-            state_map[track_id] = True
+            # Akıllı Başlangıç: İlk karede açıkça Missing tespit edildiyse derhal False (İhlal) ile başla, aksi halde True
+            if raw_state == "Missing":
+                state_map[track_id] = False
+                windows_map[track_id].append(False)
+            else:
+                state_map[track_id] = True
+                windows_map[track_id].append(True)
 
         w = windows_map[track_id]
 
-        if force_hold:
-            # 2 saniyelik dondurma sürecinde: Pencereye son bilinen durumu ekle, durumu DEĞİŞTİRME
+        if force_hold and raw_state == "Unknown":
+            # 2 saniyelik dondurma sürecinde SADECE veri belirsizse (Unknown) dondur. Açıkça Missing/Present tespit edildiyse baskılama!
             if len(w) > 0:
                 w.append(w[-1])
             return state_map[track_id]
