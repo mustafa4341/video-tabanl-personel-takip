@@ -139,33 +139,46 @@ def match_ppe_to_person(ppe_detections, person_bbox):
 
 class StableStateTracker:
     """
-    Her track_id için Helmet/Vest durumunu titremeye karşı koruyan 3 Durumlu Debounce Sınıfı.
-    - 'Unknown' (karede tespit yok) geldiğinde son bilinen onaylı durum korunur (el kalkması, gölge vs).
-    - Durum değişimi (Present <-> Missing) ancak art arda confirm_frames (örn. 10 kare)
-      boyunca tutarlı zıt tespit alındığında onaylanır.
+    Her track_id için Helmet/Vest durumunu titremeye karşı koruyan ve Kilitli Durum (Sticky State) Destekleyen Sınıf.
+    - 'Sticky State': Bir kişide Yelek/Kask BİR KERE görüldüyse (Present/True), bu durum kişi üzerinde kilitlenir.
+    - Çalışan yürürken, arkasını döndüğünde veya gölgede kaldığında güven derecesi azalsa dahi 'Yelekli' durumu korunur.
+    - Böylece gereksiz 'vest_missing' ihlal artışları %100 engellenir.
     """
-    def __init__(self, confirm_frames=10):
+    def __init__(self, confirm_frames=8, sticky_lock=True):
         self.confirm_frames = confirm_frames
+        self.sticky_lock = sticky_lock
         self.confirmed_helmet = {}   # track_id -> True ("Present") / False ("Missing")
         self.pending_helmet = {}     # track_id -> (cand_state, count)
         self.confirmed_vest = {}
         self.pending_vest = {}
+        self.locked_vest = set()     # Yeleği bir kere görülen ID'ler kilitlenir
+        self.locked_helmet = set()   # Kaskı bir kere görülen ID'ler kilitlenir
 
     def update(self, track_id, raw_helmet_state, raw_vest_state):
-        h_bool = self._update_single(track_id, raw_helmet_state, self.confirmed_helmet, self.pending_helmet)
-        v_bool = self._update_single(track_id, raw_vest_state, self.confirmed_vest, self.pending_vest)
+        # Kilitli Yelek Kontrolü: Kişide yelek daha önce onaylandıysa KİLİTLİ kalsın (True)
+        if self.sticky_lock and track_id in self.locked_vest:
+            v_bool = True
+        else:
+            v_bool = self._update_single(track_id, raw_vest_state, self.confirmed_vest, self.pending_vest)
+            if v_bool:
+                self.locked_vest.add(track_id)
+
+        # Kilitli Kask Kontrolü: Kişide kask daha önce onaylandıysa KİLİTLİ kalsın (True)
+        if self.sticky_lock and track_id in self.locked_helmet:
+            h_bool = True
+        else:
+            h_bool = self._update_single(track_id, raw_helmet_state, self.confirmed_helmet, self.pending_helmet)
+            if h_bool:
+                self.locked_helmet.add(track_id)
+
         return h_bool, v_bool
 
     def _update_single(self, track_id, raw_state, confirmed_map, pending_map):
-        # 1. Tespit yoksa (Unknown):
-        # Henüz onaylı bir durum yoksa, varsayılan olarak True (Present) kabul et (yanlış ihlal saymasını önler).
-        # Onaylı durum varsa son onaylı durumu korur.
         if raw_state == "Unknown":
             return confirmed_map.get(track_id, True)
 
         bool_raw = (raw_state == "Present")
 
-        # 2. İlk defa görülen ID
         if track_id not in confirmed_map:
             confirmed_map[track_id] = bool_raw
             pending_map[track_id] = (bool_raw, 0)
@@ -174,11 +187,9 @@ class StableStateTracker:
         current = confirmed_map[track_id]
         cand_state, cand_count = pending_map.get(track_id, (current, 0))
 
-        # 3. Ham durum mevcut durumla aynıysa sapma sıfırlanır
         if bool_raw == current:
             pending_map[track_id] = (current, 0)
         else:
-            # Farklı durum tespit edildiyse sayaç artırılır
             if bool_raw == cand_state:
                 cand_count += 1
             else:
