@@ -74,14 +74,20 @@ def match_ppe_to_person(ppe_detections, person_bbox, pose_info=None):
     Anatomik Keypoint (Pose) ve Geometrik PPE Eşleştirme.
     - pose_info varsa: Kask head_box (Burun/Kulaklar/Omuzlar), Yelek torso_box (Omuz-Kalça) üzerinden doğrulanır.
     """
+    px1, py1, px2, py2 = person_bbox
+    p_w = px2 - px1
+    p_h = py2 - py1
+    max_conf = 0.0
+
+    # 🚨 KURAL: Bbox genişliği yüksekliğinden fazla ise (p_w > p_h):
+    # Eğilme/Çömelme/Yatay duruş hareketi -> 2 saniye boyunca önceki durumu koru, değiştireme ("Unknown" nötr döndür)
+    if p_w > p_h:
+        return "Unknown", "Unknown", max_conf
+
     has_helmet = False
     has_vest = False
     no_helmet_detected = False
     no_vest_detected = False
-    max_conf = 0.0
-
-    helmet_box_found = False
-    vest_box_found = False
 
     head_box = pose_info["head_box"] if pose_info else None
     torso_box = pose_info["torso_box"] if pose_info else None
@@ -94,12 +100,10 @@ def match_ppe_to_person(ppe_detections, person_bbox, pose_info=None):
         # Pose kafa/gövde kutusu varsa öncelikli olarak pose kutusuyla doğrulama yap
         if head_box and ("Helmet" in cname):
             if not is_center_in_box(ppe_box, head_box) and compute_iou(head_box, ppe_box) < 0.05:
-                # Kafa bölgesinin dışındaysa pas geç
                 continue
 
         if torso_box and ("Vest" in cname):
             if not is_center_in_box(ppe_box, torso_box) and compute_iou(torso_box, ppe_box) < 0.05:
-                # Gövde bölgesinin dışındaysa pas geç
                 continue
 
         if not is_center_in_box(ppe_box, person_bbox):
@@ -109,21 +113,17 @@ def match_ppe_to_person(ppe_detections, person_bbox, pose_info=None):
         # Baret kontrolleri
         if cname == "Helmet" and is_ppe_belonging_to_person(ppe_box, person_bbox, "helmet"):
             has_helmet = True
-            helmet_box_found = True
             max_conf = max(max_conf, conf)
         elif cname == "No Helmet" and is_ppe_belonging_to_person(ppe_box, person_bbox, "helmet"):
             no_helmet_detected = True
-            helmet_box_found = True
             max_conf = max(max_conf, conf)
 
         # Yelek kontrolleri
         elif cname == "Safety Vests" and is_ppe_belonging_to_person(ppe_box, person_bbox, "vest"):
             has_vest = True
-            vest_box_found = True
             max_conf = max(max_conf, conf)
         elif cname == "No Safety Vest" and is_ppe_belonging_to_person(ppe_box, person_bbox, "vest"):
             no_vest_detected = True
-            vest_box_found = True
             max_conf = max(max_conf, conf)
 
     # Kask durumu (Present / Missing / Unknown)
@@ -154,6 +154,7 @@ from collections import deque
 class StableStateTracker:
     """
     Kayan Pencere (Rolling Window) tabanlı Zaman Odaklı KKD Takipçisi.
+    - Bbox genişliği yüksekliğinden fazla olduğunda (w > h) 2 saniye boyunca durumu dondurur.
     - Zamana Dayalı (FPS-Independent): Sabit kare sayısı yerine videonun gerçek FPS değerine göre 
       pencere boyutunu dinamik hesaplar (her zaman gerçek 2.0s pencere, 1.5s min gözlem).
     - Asimetrik Eşikler:
@@ -165,6 +166,7 @@ class StableStateTracker:
         self.fps = fps if fps > 0 else 30.0
         self.window_size = max(10, int(self.fps * window_sec))
         self.min_observations = max(5, int(self.fps * min_obs_sec))
+        self.hold_frames_limit = int(self.fps * 2.0)  # Her zaman gerçek 2.0 saniye dondurma süresi
         self.present_ratio = present_ratio
         self.missing_ratio = missing_ratio
 
@@ -173,23 +175,39 @@ class StableStateTracker:
 
         self.helmet_state = {}    # track_id -> bool
         self.vest_state = {}      # track_id -> bool
+        self.hold_counters = {}   # track_id -> remaining_hold_frames
 
     def update(self, track_id, raw_helmet_state, raw_vest_state):
+        # Eğilme/Çömelme nedeniyle "Unknown" geldiyse 2 saniyelik dondurma sayacını kur
+        if raw_helmet_state == "Unknown" or raw_vest_state == "Unknown":
+            current_hold = self.hold_counters.get(track_id, 0)
+            self.hold_counters[track_id] = max(current_hold, self.hold_frames_limit)
+
+        is_holding = self.hold_counters.get(track_id, 0) > 0
+        if is_holding:
+            self.hold_counters[track_id] -= 1
+
         h_bool = self._update_single(
-            track_id, raw_helmet_state, self.helmet_windows, self.helmet_state
+            track_id, raw_helmet_state, self.helmet_windows, self.helmet_state, force_hold=is_holding
         )
         v_bool = self._update_single(
-            track_id, raw_vest_state, self.vest_windows, self.vest_state
+            track_id, raw_vest_state, self.vest_windows, self.vest_state, force_hold=is_holding
         )
         return h_bool, v_bool
 
-    def _update_single(self, track_id, raw_state, windows_map, state_map):
+    def _update_single(self, track_id, raw_state, windows_map, state_map, force_hold=False):
         if track_id not in windows_map:
             windows_map[track_id] = deque(maxlen=self.window_size)
             # Yanlış ihlal yazılmaması için başlangıç nötr True kabul edilir
             state_map[track_id] = True
 
         w = windows_map[track_id]
+
+        if force_hold:
+            # 2 saniyelik dondurma sürecinde: Pencereye son bilinen durumu ekle, durumu DEĞİŞTİRME
+            if len(w) > 0:
+                w.append(w[-1])
+            return state_map[track_id]
 
         if raw_state == "Present":
             w.append(True)
