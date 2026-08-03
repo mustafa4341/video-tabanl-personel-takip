@@ -61,8 +61,8 @@ def is_ppe_belonging_to_person(ppe_box, person_box, ppe_type="helmet"):
             # Eğilmiş/eğik duran kişide baret kutunun herhangi bir yerinde olabilir
             return True
         else:
-            # Ayaktaki kişide baret üst %60'lık kafa bölgesinde olmalı
-            return cy <= py1 + p_h * 0.60
+            # Ayaktaki kişide baret üst %35'lik kafa bölgesinde olmalı
+            return cy <= py1 + p_h * 0.35
     elif ppe_type == "vest":
         # Yelek kutusu zaten insan kutusunun içinde ise (is_center_in_box) geçerli sayılır (eğilme/yan durma uyumlu)
         return True
@@ -139,68 +139,70 @@ def match_ppe_to_person(ppe_detections, person_bbox):
 
 class StableStateTracker:
     """
-    Her track_id için Helmet/Vest durumunu titremeye karşı koruyan ve Kilitli Durum (Sticky State) Destekleyen Sınıf.
-    - 'Sticky State': Bir kişide Yelek/Kask BİR KERE görüldüyse (Present/True), bu durum kişi üzerinde kilitlenir.
-    - Çalışan yürürken, arkasını döndüğünde veya gölgede kaldığında güven derecesi azalsa dahi 'Yelekli' durumu korunur.
-    - Böylece gereksiz 'vest_missing' ihlal artışları %100 engellenir.
+    Her track_id için Helmet/Vest durumunu titremeye karşı koruyan Asimetrik Debounce Sınıfı.
+    - 'Present' (Var): 5 kare boyunca tutarlı tespit alındığında durum 'Present' (Yeşil) olur.
+    - 'Unknown' (Açı Değişimi/Gölge): Tespit alınamasa bile mevcut durum korunur (titreme yapmaz).
+    - 'Missing' (İhlal Onayı): Eğer model kesintisiz 12 kare boyunca açıkça 'Missing' (Kask/Yelek Yok)
+      tespit ederse, hatalı kilit kırılarak durum 'Missing' (Kırmızı - İhlal) yapılır.
     """
-    def __init__(self, confirm_frames=8, sticky_lock=True):
-        self.confirm_frames = confirm_frames
-        self.sticky_lock = sticky_lock
+    def __init__(self, present_confirm_frames=5, missing_confirm_frames=12):
+        self.present_confirm_frames = present_confirm_frames
+        self.missing_confirm_frames = missing_confirm_frames
         self.confirmed_helmet = {}   # track_id -> True ("Present") / False ("Missing")
         self.pending_helmet = {}     # track_id -> (cand_state, count)
         self.confirmed_vest = {}
         self.pending_vest = {}
-        self.locked_vest = set()     # Yeleği bir kere görülen ID'ler kilitlenir
-        self.locked_helmet = set()   # Kaskı bir kere görülen ID'ler kilitlenir
 
     def update(self, track_id, raw_helmet_state, raw_vest_state):
-        # Kilitli Yelek Kontrolü: Kişide yelek daha önce onaylandıysa KİLİTLİ kalsın (True)
-        if self.sticky_lock and track_id in self.locked_vest:
-            v_bool = True
-        else:
-            v_bool = self._update_single(track_id, raw_vest_state, self.confirmed_vest, self.pending_vest)
-            if v_bool:
-                self.locked_vest.add(track_id)
-
-        # Kilitli Kask Kontrolü: Kişide kask daha önce onaylandıysa KİLİTLİ kalsın (True)
-        if self.sticky_lock and track_id in self.locked_helmet:
-            h_bool = True
-        else:
-            h_bool = self._update_single(track_id, raw_helmet_state, self.confirmed_helmet, self.pending_helmet)
-            if h_bool:
-                self.locked_helmet.add(track_id)
-
+        h_bool = self._update_single(
+            track_id, raw_helmet_state, self.confirmed_helmet, self.pending_helmet
+        )
+        v_bool = self._update_single(
+            track_id, raw_vest_state, self.confirmed_vest, self.pending_vest
+        )
         return h_bool, v_bool
 
     def _update_single(self, track_id, raw_state, confirmed_map, pending_map):
+        # 1. İlk defa görülen ID
+        if track_id not in confirmed_map:
+            # Varsayılan olarak raw_state Present ise True, aksi halde False başlat
+            initial = (raw_state == "Present")
+            confirmed_map[track_id] = initial
+            pending_map[track_id] = (raw_state, 1)
+            return initial
+
+        current = confirmed_map[track_id]
+
+        # 2. Unknown (gölge, açı değişimi, tespit yok):
+        # Mevcut onaylı durumu korur (titremeyi ve yanlış ihlalleri engeller)
         if raw_state == "Unknown":
-            return confirmed_map.get(track_id, True)
+            pending_map[track_id] = (raw_state, 0)
+            return current
 
         bool_raw = (raw_state == "Present")
 
-        if track_id not in confirmed_map:
-            confirmed_map[track_id] = bool_raw
-            pending_map[track_id] = (bool_raw, 0)
-            return bool_raw
-
-        current = confirmed_map[track_id]
-        cand_state, cand_count = pending_map.get(track_id, (current, 0))
-
+        # 3. Ham tespit onaylı durumla aynıysa sayaç sıfırlanır
         if bool_raw == current:
-            pending_map[track_id] = (current, 0)
+            pending_map[track_id] = (raw_state, 0)
+            return current
+
+        # 4. Zıt tespit alındıysa (Current Present iken Raw Missing veya tam tersi)
+        cand_state, cand_count = pending_map.get(track_id, (raw_state, 0))
+
+        if raw_state == cand_state:
+            cand_count += 1
         else:
-            if bool_raw == cand_state:
-                cand_count += 1
-            else:
-                cand_state, cand_count = bool_raw, 1
+            cand_state, cand_count = raw_state, 1
 
-            if cand_count >= self.confirm_frames:
-                current = cand_state
-                cand_count = 0
-                confirmed_map[track_id] = current
+        # Gerekli onay kare sayısı: Missing'e geçiş için 12 kare, Present'a geçiş için 5 kare
+        required_frames = self.missing_confirm_frames if not bool_raw else self.present_confirm_frames
 
-            pending_map[track_id] = (cand_state, cand_count)
+        if cand_count >= required_frames:
+            current = bool_raw
+            cand_count = 0
+            confirmed_map[track_id] = current
+
+        pending_map[track_id] = (cand_state, cand_count)
 
         return confirmed_map[track_id]
 
