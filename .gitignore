@@ -1,10 +1,11 @@
 .venv/
 __pycache__/
 *.pyc
-datasets/construction_safety/
+datasets/
 runs/
 outputs/
 video/*.mp4
 *.pt
+*.onnx
 !models/best.pt
 

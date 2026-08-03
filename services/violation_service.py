@@ -70,6 +70,29 @@ class ViolationManager:
         } for v in self.recent_violations]
 
 
+    def revoke_violation(self, stable_id, violation_type):
+        """
+        Daha önce kaydedilen bir ihlalin (örneğin sonraki karelerde yeleğin/kaskın olduğu kesinleştiğinde)
+        iptal edilmesini ve rapordan/diskten silinmesini sağlar.
+        """
+        revoked = False
+        new_list = []
+        for v in self.recent_violations:
+            if v["stable_id"] == stable_id and v["violation"] == violation_type:
+                revoked = True
+                img_path = v.get("image_path")
+                if img_path and os.path.exists(img_path):
+                    try:
+                        os.remove(img_path)
+                    except Exception:
+                        pass
+            else:
+                new_list.append(v)
+
+        self.recent_violations = new_list
+        return revoked
+
+
 class ViolationService:
     def __init__(self, threshold=15, time_gap=3.0):
         self.threshold = threshold
@@ -91,45 +114,57 @@ class ViolationService:
 
         person_data = self.counters[tracker_id]
 
-        # Kask takibi
+        # ── KASK TAKİBİ VE İHLAL İPTALİ ──────────────────────────────────────
         if not has_helmet:
             person_data["helmet_missing"] += 1
         else:
             person_data["helmet_missing"] = 0
-            person_data["helmet_violated"] = False
+            # Eğer daha önce bu kişiye kask ihlali yazıldıysa ve şimdi kaskı doğrulandıysa İPTAL ET
+            if person_data["helmet_violated"]:
+                revoked = self.manager.revoke_violation(tracker_id, "helmet_missing")
+                if revoked:
+                    self.helmet_violation_count = max(0, self.helmet_violation_count - 1)
+                person_data["helmet_violated"] = False
 
-        # Yelek takibi
+        # ── YELEK TAKİBİ VE İHLAL İPTALİ ──────────────────────────────────────
         if not has_vest:
             person_data["vest_missing"] += 1
         else:
             person_data["vest_missing"] = 0
-            person_data["vest_violated"] = False
+            # Eğer daha önce bu kişiye yelek ihlali yazıldıysa ve şimdi yeleği doğrulandıysa İPTAL ET
+            if person_data["vest_violated"]:
+                revoked = self.manager.revoke_violation(tracker_id, "vest_missing")
+                if revoked:
+                    self.vest_violation_count = max(0, self.vest_violation_count - 1)
+                person_data["vest_violated"] = False
 
         # Kask ihlali kontrolü (15 kare eşiği)
         if person_data["helmet_missing"] >= self.threshold:
-            person_data["helmet_violated"] = True
-            is_new = self.manager.should_log_and_screenshot(
-                stable_id=tracker_id,
-                violation_type="helmet_missing",
-                frame_time=frame_time,
-                frame=frame,
-                confidence=confidence
-            )
-            if is_new:
-                self.helmet_violation_count += 1
+            if not person_data["helmet_violated"]:
+                person_data["helmet_violated"] = True
+                is_new = self.manager.should_log_and_screenshot(
+                    stable_id=tracker_id,
+                    violation_type="helmet_missing",
+                    frame_time=frame_time,
+                    frame=frame,
+                    confidence=confidence
+                )
+                if is_new:
+                    self.helmet_violation_count += 1
 
         # Yelek ihlali kontrolü (15 kare eşiği)
         if person_data["vest_missing"] >= self.threshold:
-            person_data["vest_violated"] = True
-            is_new = self.manager.should_log_and_screenshot(
-                stable_id=tracker_id,
-                violation_type="vest_missing",
-                frame_time=frame_time,
-                frame=frame,
-                confidence=confidence
-            )
-            if is_new:
-                self.vest_violation_count += 1
+            if not person_data["vest_violated"]:
+                person_data["vest_violated"] = True
+                is_new = self.manager.should_log_and_screenshot(
+                    stable_id=tracker_id,
+                    violation_type="vest_missing",
+                    frame_time=frame_time,
+                    frame=frame,
+                    confidence=confidence
+                )
+                if is_new:
+                    self.vest_violation_count += 1
 
     def is_person_in_violation(self, tracker_id):
         """Kişinin anlık ihlal durumunda olup olmadığını söyler."""

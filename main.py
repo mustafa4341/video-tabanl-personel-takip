@@ -4,11 +4,12 @@ import time
 import argparse
 from detectors.person_detector import PersonDetector
 from detectors.ppe_detector import PPEDetector
+from detectors.pose_detector import PoseDetector
 from tracking.person_tracker import PersonTracker
 from services.violation_service import ViolationService
 from services.video_service import VideoWriter
 from utils.drawing import drawing_person, draw_osd_panel
-from utils.geometry import match_ppe_to_person, StableStateTracker
+from utils.geometry import match_ppe_to_person, StableStateTracker, compute_iou, is_center_in_box
 
 
 # ── Argüman: video dosyası yolu ──────────────────────────────────────────────
@@ -40,9 +41,10 @@ print(f"Model: {args.model} | FPS: {fps_video:.1f} | Toplam Kare: {total_frames}
 # ── Nesneler ─────────────────────────────────────────────────────────────────
 # BoT-SORT ReID + 3 kare filtresi hız kaybı olmadan ID stabilitesi sağlar
 detector          = PersonDetector(model_path=args.model, conf_threshold=0.20, imgsz=1024)
-ppe_detector      = PPEDetector(model_path="models/best.pt", conf_threshold=0.40, imgsz=640)
+ppe_detector      = PPEDetector(model_path="models/best.pt", conf_helmet=0.30, conf_vest=0.35, imgsz=640)
+pose_detector     = PoseDetector(model_path="models/yolo11n-pose.pt", conf_threshold=0.30)
 tracker           = PersonTracker(min_box_area=100, min_confirm_frames=3)
-state_tracker     = StableStateTracker(present_confirm_frames=5, missing_confirm_frames=12)
+state_tracker     = StableStateTracker(fps=fps_video, window_sec=2.0, min_obs_sec=1.5, present_ratio=0.75, missing_ratio=0.35)
 violation_service = ViolationService(threshold=15)
 video_writer      = VideoWriter(output_path=args.output, fps=fps_video)
 
@@ -77,20 +79,30 @@ while True:
     # 1. Kişileri BoT-SORT (ReID destekli) ile tespit et ve takip et
     track_results = detector.track(frame, persist=True)
 
-    # 2. PPE'leri tespit et (Gerçek zamanlı FPS için her 2 karede bir çalıştırılır, doğruluğu etkilemez)
+    # 2. PPE ve Pose (Anatomi) tespiti (Her 2 karede bir çalıştırılır)
     if frame_index == 1 or frame_index % 2 == 1 or 'ppe_detections' not in locals():
         ppe_detections = ppe_detector.detect(frame)
+        pose_data = pose_detector.predict(frame)
 
     # 3. Takip sonuçlarını 3 kare onay filtresi, kutu temizliği ve TrackStitcher'dan geçir
     tracked_persons = tracker.update(persons=None, results_with_tracking=track_results, frame_index=frame_index)
 
-    # 4. Her kişi için PPE eşleştir ve ihlal kontrolü yap
+    # 4. Her kişi için Pose (Anatomi) ve PPE eşleştir
     for person in tracked_persons:
         pid   = person["tracker_id"]
         pbbox = person["bbox"]
 
-        # Üç Durumlu (Present / Missing / Unknown) ve duruşa duyarlı PPE eşleştirme
-        raw_h_state, raw_v_state, max_conf = match_ppe_to_person(ppe_detections, pbbox)
+        # Kişiye ait Pose (Keypoint) verisini bul (en yüksek IoU / merkez çakışması)
+        best_pose = None
+        best_iou = 0.0
+        for pdata in pose_data:
+            iou = compute_iou(pbbox, pdata["person_box"])
+            if iou > best_iou:
+                best_iou = iou
+                best_pose = pdata
+
+        # Anatomik Keypoint (Pose) ve duruşa duyarlı PPE eşleştirme
+        raw_h_state, raw_v_state, max_conf = match_ppe_to_person(ppe_detections, pbbox, pose_info=best_pose)
 
         # El hareketi / gölge / tespit yokluğunda son bilinen onaylı durumu koruyan Debounce Filtresi
         has_helmet, has_vest = state_tracker.update(pid, raw_h_state, raw_v_state)

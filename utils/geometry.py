@@ -69,12 +69,10 @@ def is_ppe_belonging_to_person(ppe_box, person_box, ppe_type="helmet"):
     return True
 
 
-def match_ppe_to_person(ppe_detections, person_bbox):
+def match_ppe_to_person(ppe_detections, person_bbox, pose_info=None):
     """
-    ÜÇ DURUMLU (Present / Missing / Unknown) PPE Eşleştirme.
-    - 'Present': Bu karede Helmet / Safety Vest tespiti eşleşti.
-    - 'Missing': Bu karede açıkça No Helmet / No Safety Vest tespiti eşleşti.
-    - 'Unknown': Bu karede bu kişi için hiçbir PPE kutusu bulunamadı (el kalktı, gölge vs).
+    Anatomik Keypoint (Pose) ve Geometrik PPE Eşleştirme.
+    - pose_info varsa: Kask head_box (Burun/Kulaklar/Omuzlar), Yelek torso_box (Omuz-Kalça) üzerinden doğrulanır.
     """
     has_helmet = False
     has_vest = False
@@ -85,10 +83,24 @@ def match_ppe_to_person(ppe_detections, person_bbox):
     helmet_box_found = False
     vest_box_found = False
 
+    head_box = pose_info["head_box"] if pose_info else None
+    torso_box = pose_info["torso_box"] if pose_info else None
+
     for ppe in ppe_detections:
         cname = ppe["class_name"]
         ppe_box = ppe["bbox"]
         conf = ppe["confidence"]
+
+        # Pose kafa/gövde kutusu varsa öncelikli olarak pose kutusuyla doğrulama yap
+        if head_box and ("Helmet" in cname):
+            if not is_center_in_box(ppe_box, head_box) and compute_iou(head_box, ppe_box) < 0.05:
+                # Kafa bölgesinin dışındaysa pas geç
+                continue
+
+        if torso_box and ("Vest" in cname):
+            if not is_center_in_box(ppe_box, torso_box) and compute_iou(torso_box, ppe_box) < 0.05:
+                # Gövde bölgesinin dışındaysa pas geç
+                continue
 
         if not is_center_in_box(ppe_box, person_bbox):
             if compute_iou(person_bbox, ppe_box) < 0.05:
@@ -118,93 +130,92 @@ def match_ppe_to_person(ppe_detections, person_bbox):
     if has_helmet:
         helmet_raw_state = "Present"
     elif no_helmet_detected:
-        helmet_raw_state = "Missing"
-    elif helmet_box_found:
-        helmet_raw_state = "Missing"
+        helmet_raw_state = "Missing"  # Model açıkça No Helmet tespit etti -> Negatif Kanıt
+    elif pose_info and not pose_info.get("has_valid_head_keypoints", True):
+        helmet_raw_state = "Unknown"  # Kafa keypoint güveni < 0.5 -> Göremedim (Nötr)
     else:
-        helmet_raw_state = "Unknown"  # Karede hiçbir kask nesnesi bulunamadı
+        helmet_raw_state = "Unknown"  # Model göremedi/açı kaybı var -> Kanıt Yok (Nötr)
 
     # Yelek durumu (Present / Missing / Unknown)
     if has_vest:
         vest_raw_state = "Present"
     elif no_vest_detected:
-        vest_raw_state = "Missing"
-    elif vest_box_found:
-        vest_raw_state = "Missing"
+        vest_raw_state = "Missing"   # Model açıkça No Safety Vest tespit etti -> Negatif Kanıt
+    elif pose_info and not pose_info.get("has_valid_torso_keypoints", True):
+        vest_raw_state = "Unknown"   # Gövde keypoint güveni < 0.5 -> Göremedim (Nötr)
     else:
-        vest_raw_state = "Unknown"  # Karede hiçbir yelek nesnesi bulunamadı
+        vest_raw_state = "Unknown"   # Model göremedi/açı kaybı var -> Kanıt Yok (Nötr)
 
     return helmet_raw_state, vest_raw_state, max_conf
 
 
+from collections import deque
+
 class StableStateTracker:
     """
-    Her track_id için Helmet/Vest durumunu titremeye karşı koruyan Asimetrik Debounce Sınıfı.
-    - 'Present' (Var): 5 kare boyunca tutarlı tespit alındığında durum 'Present' (Yeşil) olur.
-    - 'Unknown' (Açı Değişimi/Gölge): Tespit alınamasa bile mevcut durum korunur (titreme yapmaz).
-    - 'Missing' (İhlal Onayı): Eğer model kesintisiz 12 kare boyunca açıkça 'Missing' (Kask/Yelek Yok)
-      tespit ederse, hatalı kilit kırılarak durum 'Missing' (Kırmızı - İhlal) yapılır.
+    Kayan Pencere (Rolling Window) tabanlı Zaman Odaklı KKD Takipçisi.
+    - Zamana Dayalı (FPS-Independent): Sabit kare sayısı yerine videonun gerçek FPS değerine göre 
+      pencere boyutunu dinamik hesaplar (her zaman gerçek 2.0s pencere, 1.5s min gözlem).
+    - Asimetrik Eşikler:
+      * present_ratio (0.75): "Var" (True) demek için pencerenin en az %75'i gerekli (Güçlü kanıt şartı).
+      * missing_ratio (0.35): "Yok" (False) demek için %35 veya altı yeterli (Güvenlik öncelikli ihlal tarafına düşme).
+      * %35 - %75 arası: Belirsiz ara bölge, son onaylı durumu korur (titremeyi engeller).
     """
-    def __init__(self, present_confirm_frames=5, missing_confirm_frames=12):
-        self.present_confirm_frames = present_confirm_frames
-        self.missing_confirm_frames = missing_confirm_frames
-        self.confirmed_helmet = {}   # track_id -> True ("Present") / False ("Missing")
-        self.pending_helmet = {}     # track_id -> (cand_state, count)
-        self.confirmed_vest = {}
-        self.pending_vest = {}
+    def __init__(self, fps=30.0, window_sec=2.0, min_obs_sec=1.5, present_ratio=0.75, missing_ratio=0.35):
+        self.fps = fps if fps > 0 else 30.0
+        self.window_size = max(10, int(self.fps * window_sec))
+        self.min_observations = max(5, int(self.fps * min_obs_sec))
+        self.present_ratio = present_ratio
+        self.missing_ratio = missing_ratio
+
+        self.helmet_windows = {}  # track_id -> deque(maxlen=window_size)
+        self.vest_windows = {}    # track_id -> deque(maxlen=window_size)
+
+        self.helmet_state = {}    # track_id -> bool
+        self.vest_state = {}      # track_id -> bool
 
     def update(self, track_id, raw_helmet_state, raw_vest_state):
         h_bool = self._update_single(
-            track_id, raw_helmet_state, self.confirmed_helmet, self.pending_helmet
+            track_id, raw_helmet_state, self.helmet_windows, self.helmet_state
         )
         v_bool = self._update_single(
-            track_id, raw_vest_state, self.confirmed_vest, self.pending_vest
+            track_id, raw_vest_state, self.vest_windows, self.vest_state
         )
         return h_bool, v_bool
 
-    def _update_single(self, track_id, raw_state, confirmed_map, pending_map):
-        # 1. İlk defa görülen ID
-        if track_id not in confirmed_map:
-            # Varsayılan olarak raw_state Present ise True, aksi halde False başlat
-            initial = (raw_state == "Present")
-            confirmed_map[track_id] = initial
-            pending_map[track_id] = (raw_state, 1)
-            return initial
+    def _update_single(self, track_id, raw_state, windows_map, state_map):
+        if track_id not in windows_map:
+            windows_map[track_id] = deque(maxlen=self.window_size)
+            # Yanlış ihlal yazılmaması için başlangıç nötr True kabul edilir
+            state_map[track_id] = True
 
-        current = confirmed_map[track_id]
+        w = windows_map[track_id]
 
-        # 2. Unknown (gölge, açı değişimi, tespit yok):
-        # Mevcut onaylı durumu korur (titremeyi ve yanlış ihlalleri engeller)
-        if raw_state == "Unknown":
-            pending_map[track_id] = (raw_state, 0)
-            return current
-
-        bool_raw = (raw_state == "Present")
-
-        # 3. Ham tespit onaylı durumla aynıysa sayaç sıfırlanır
-        if bool_raw == current:
-            pending_map[track_id] = (raw_state, 0)
-            return current
-
-        # 4. Zıt tespit alındıysa (Current Present iken Raw Missing veya tam tersi)
-        cand_state, cand_count = pending_map.get(track_id, (raw_state, 0))
-
-        if raw_state == cand_state:
-            cand_count += 1
+        if raw_state == "Present":
+            w.append(True)
+            # Ayağa kalkma sonrası hızlı toparlanma: Son 3 kare üst üste Present geldiyse geçmişteki bükülme gürültülerini temizle
+            if len(w) >= 3 and w[-1] is True and w[-2] is True and w[-3] is True:
+                # Sadece True olanları tutarak kayar pencereyi hızlı doğrula
+                new_w = deque([True] * len(w), maxlen=self.window_size)
+                windows_map[track_id] = new_w
+                w = new_w
+        elif raw_state == "Missing":
+            w.append(False)
         else:
-            cand_state, cand_count = raw_state, 1
+            # Unknown (gölge, açı değişimi, eğilme): Pencerede veri varsa son onaylı durumu koru
+            if len(w) > 0:
+                w.append(w[-1])
 
-        # Gerekli onay kare sayısı: Missing'e geçiş için 12 kare, Present'a geçiş için 5 kare
-        required_frames = self.missing_confirm_frames if not bool_raw else self.present_confirm_frames
+        # ~1.5 saniye (min_observations) veri birikmeden ani durum değişikliği yapma
+        if len(w) >= self.min_observations:
+            true_ratio = sum(1 for item in w if item is True) / len(w)
+            if true_ratio >= self.present_ratio:
+                state_map[track_id] = True
+            elif true_ratio <= self.missing_ratio:
+                state_map[track_id] = False
+            # Ara bölgede (%35 - %75): son onaylı durumu koru, ani sıçrama yapma
 
-        if cand_count >= required_frames:
-            current = bool_raw
-            cand_count = 0
-            confirmed_map[track_id] = current
-
-        pending_map[track_id] = (cand_state, cand_count)
-
-        return confirmed_map[track_id]
+        return state_map[track_id]
 
 
 
